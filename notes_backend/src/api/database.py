@@ -1,4 +1,5 @@
 import os
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Generator
@@ -11,45 +12,70 @@ from sqlalchemy import (
     Text,
     create_engine,
     event,
-) 
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+)
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB as PG_JSONB
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-# Prefer Supabase Postgres via DATABASE_URL.
-# IMPORTANT: Do not hardcode credentials; must be provided through environment.
-# For Supabase use: postgresql+psycopg2://...:5432/postgres?sslmode=require
-DATABASE_URL = os.getenv("DATABASE_URL")  # No SQLite fallback per requirement
+# Logger for database setup messages
+logger = logging.getLogger(__name__)
 
-if not DATABASE_URL:
-    # Raise clear error to prompt correct env configuration in CI/runtime
-    raise RuntimeError(
-        "DATABASE_URL is not set. Please provide Supabase Postgres connection string in environment."
+# Determine database URL and whether we're using Postgres (Supabase) or SQLite fallback
+DATABASE_URL = os.getenv("DATABASE_URL")
+USING_POSTGRES = bool(DATABASE_URL)
+
+# If DATABASE_URL is not provided, use a local SQLite file to enable dev-only fallback
+if not USING_POSTGRES:
+    fallback_url = "sqlite:///./dev.db"
+    DATABASE_URL = fallback_url
+    logger.warning(
+        "DATABASE_URL not set. Falling back to local SQLite database at %s for development. "
+        "Set DATABASE_URL to your Supabase Postgres URI in production.", fallback_url
     )
 
-# Connection args:
+# Connection args and engine setup
 connect_args = {}
-# Enable pool_pre_ping to avoid stale connections; SSL handled via URL (sslmode=require)
+# For SQLite, disable check_same_thread to allow usage across threads (e.g., FastAPI)
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
 engine = create_engine(
     DATABASE_URL,
     echo=False,
     future=True,
     connect_args=connect_args,
-    pool_pre_ping=True,
+    pool_pre_ping=True,  # helps avoid stale connections in Postgres
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
 
 Base = declarative_base()
 
+# Define adapter types depending on backend.
+# For SQLite, we don't have native UUID/JSONB; use TEXT for UUID and TEXT for JSON serialization via ORM defaults.
+# To keep API contract intact while enabling SQLite, we will map:
+# - UUID as TEXT when not using Postgres
+# - JSONB as Text (storing JSON-encoded list) is not necessary if we keep Python list and let SQLAlchemy handle with SQLite (it will pickle unless specified).
+#   Instead, since SQLAlchemy 2.x doesn't provide JSON for SQLite by default without extra type, we will store as Text containing JSON string? That complicates.
+#   Easier approach: for SQLite, use Text and keep Python list by serializing/deserializing at the app level is overkill.
+#   However, SQLAlchemy can use the generic JSON type which works across backends; but we didn't import it earlier.
+# Use SQLAlchemy generic JSON for cross-dialect compatibility.
+from sqlalchemy import JSON as SA_JSON  # generic JSON type works for SQLite and Postgres (maps to JSON/JSONB)
+
+# Column type helpers
+UUIDType = PG_UUID(as_uuid=True) if USING_POSTGRES else Text
+JSONType = PG_JSONB if USING_POSTGRES else SA_JSON
+
 
 class Note(Base):
-    """SQLAlchemy model for Note entity mapped to public.notes in Supabase."""
+    """SQLAlchemy model for Note entity mapped to 'notes' table.
+
+    Uses UUID primary key for Postgres; when using SQLite fallback, stores as text.
+    """
     __tablename__ = "notes"
 
-    # Supabase schema: id uuid pk, title text, content text, tags jsonb, is_archived boolean, created_at/updated_at timestamptz
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     title = Column(Text, nullable=False, index=True)
     content = Column(Text, nullable=False)
-    tags = Column(JSONB, nullable=False, default=list)  # default to [] at ORM level
+    tags = Column(JSONType, nullable=False, default=list)  # default to [] at ORM level
     is_archived = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -58,7 +84,6 @@ class Note(Base):
 @event.listens_for(Note, "before_update", propagate=True)
 def receive_before_update(mapper, connection, target):
     # Automatically update the updated_at timestamp in application as backup;
-    # Supabase trigger also sets updated_at = now().
     target.updated_at = datetime.now(timezone.utc)
 
 
@@ -66,16 +91,19 @@ def init_db() -> None:
     """
     Initialize database metadata.
 
-    For managed Supabase Postgres with RLS, DDL should be handled via migrations or SQL scripts.
-    This function intentionally avoids creating tables automatically in production.
-    It will attempt to reflect metadata creation only if the table exists.
+    Behavior:
+    - If using Supabase/Postgres (DATABASE_URL provided): do NOT create tables (managed externally).
+    - If using SQLite fallback: create tables locally via SQLAlchemy metadata for development convenience.
     """
     try:
-        # No-op for Supabase; keep function for app startup compatibility.
-        # Do not call Base.metadata.create_all(bind=engine) to avoid privilege issues under RLS.
-        pass
+        if USING_POSTGRES:
+            # No-op for Supabase; avoid DDL under managed Postgres with RLS/migrations.
+            logger.info("Postgres detected via DATABASE_URL. Skipping automatic DDL.")
+            return
+        # SQLite dev fallback: create tables if not present
+        logger.info("SQLite fallback active. Creating tables if they do not exist...")
+        Base.metadata.create_all(bind=engine)
     except Exception as exc:
-        # Log-friendly raise if needed by calling context
         raise RuntimeError(f"Database initialization failed: {exc}") from exc
 
 
