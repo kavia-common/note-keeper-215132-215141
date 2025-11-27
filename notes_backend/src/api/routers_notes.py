@@ -1,4 +1,5 @@
 from typing import List, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -28,9 +29,10 @@ def list_notes(
         # Simple case-insensitive contains search
         stmt = stmt.where(Note.title.ilike(f"%{q}%"))
     if archived is not None:
-        stmt = stmt.where(Note.archived == archived)
+        stmt = stmt.where(Note.is_archived == archived)
     stmt = stmt.order_by(Note.updated_at.desc())
     notes = db.execute(stmt).scalars().all()
+    # Pydantic model maps is_archived -> archived externally; tags passed through
     return notes
 
 
@@ -42,7 +44,7 @@ def list_notes(
     description="Fetches a single note by its identifier.",
     responses={404: {"description": "Note not found"}},
 )
-def get_note(note_id: int, db: Session = Depends(get_db)):
+def get_note(note_id: UUID, db: Session = Depends(get_db)):
     """Retrieve a note by ID or 404 if not found."""
     note = db.get(Note, note_id)
     if not note:
@@ -61,7 +63,12 @@ def get_note(note_id: int, db: Session = Depends(get_db)):
 )
 def create_note(payload: NoteCreate, db: Session = Depends(get_db)):
     """Create a new note."""
-    note = Note(title=payload.title, content=payload.content, archived=payload.archived or False)
+    note = Note(
+        title=payload.title,
+        content=payload.content,
+        is_archived=payload.archived or False,
+        tags=payload.tags or [],
+    )
     db.add(note)
     db.commit()
     db.refresh(note)
@@ -76,7 +83,7 @@ def create_note(payload: NoteCreate, db: Session = Depends(get_db)):
     description="Updates an existing note. Any provided fields will be applied.",
     responses={404: {"description": "Note not found"}},
 )
-def update_note(note_id: int, payload: NoteUpdate, db: Session = Depends(get_db)):
+def update_note(note_id: UUID, payload: NoteUpdate, db: Session = Depends(get_db)):
     """Update note by ID."""
     note = db.get(Note, note_id)
     if not note:
@@ -87,7 +94,9 @@ def update_note(note_id: int, payload: NoteUpdate, db: Session = Depends(get_db)
     if payload.content is not None:
         note.content = payload.content
     if payload.archived is not None:
-        note.archived = payload.archived
+        note.is_archived = payload.archived
+    if payload.tags is not None:
+        note.tags = payload.tags
 
     db.add(note)
     db.commit()
@@ -103,7 +112,7 @@ def update_note(note_id: int, payload: NoteUpdate, db: Session = Depends(get_db)
     description="Deletes a note by its identifier.",
     responses={404: {"description": "Note not found"}},
 )
-def delete_note(note_id: int, db: Session = Depends(get_db)):
+def delete_note(note_id: UUID, db: Session = Depends(get_db)):
     """Delete a note by ID."""
     note = db.get(Note, note_id)
     if not note:
